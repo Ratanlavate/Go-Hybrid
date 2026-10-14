@@ -160,8 +160,11 @@ jobs:
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./hybridge/
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./hybridge/
           # row 18: the workload triplet's shapes are emitted by shape.py —
-          # drift between the generator and the committed programs fails CI
-          python3 benchmarks/workloads/shape.py --check
+          # drift between the generator and the committed programs fails CI.
+          # Absolute path: this step `cd /tmp/goci` above, so a repo-relative
+          # path did not resolve (shape.py itself is cwd-independent — it
+          # locates its files via __file__).
+          python3 "$GITHUB_WORKSPACE/benchmarks/workloads/shape.py" --check
           echo "go runtime hygiene OK"
       - name: MVP-0 examples end-to-end (parse → check → emit → go build → run)
         run: |
