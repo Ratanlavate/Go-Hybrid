@@ -587,6 +587,29 @@ impl Emitter {
             return self.emit_make(args);
         }
 
+        // --- `len(s)` / `delete(s, v)` on a set-typed var -> prelude methods
+        //     (issue #646): Go's builtin `len`/`delete` reject the `set[…]`
+        //     struct, so route them to the SET_PRELUDE methods. ---
+        if let Expr::Ident { name, .. } = callee {
+            if name == "len" && args.len() == 1 {
+                if let Expr::Ident { name: vn, .. } = &args[0].value {
+                    if self.set_vars.contains(vn) {
+                        let b = self.emit_expr(&args[0].value, ATOM)?;
+                        return Ok(format!("{}.len()", b));
+                    }
+                }
+            }
+            if name == "delete" && args.len() == 2 {
+                if let Expr::Ident { name: vn, .. } = &args[0].value {
+                    if self.set_vars.contains(vn) {
+                        let b = self.emit_expr(&args[0].value, ATOM)?;
+                        let v = self.emit_call_arg(&args[1])?;
+                        return Ok(format!("{}.remove({})", b, v));
+                    }
+                }
+            }
+        }
+
         // --- package-qualified calls ---
         if let Expr::Field { base, name, .. } = callee {
             if let Expr::Ident { name: pkg, .. } = base.as_ref() {

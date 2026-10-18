@@ -53,6 +53,24 @@ const OPTION_PRELUDE: &str = concat!(
     "func some[v any](val v) option[v] {\n",
     "\treturn option[v]{val: val, ok: true}\n",
     "}\n",
+    "\n",
+    "func (o option[v]) unwrap() v {\n",
+    "\tif !o.ok {\n",
+    "\t\tpanic(\"HY-PANIC/unwrap-none\")\n",
+    "\t}\n",
+    "\treturn o.val\n",
+    "}\n",
+    "\n",
+    "func (o option[v]) or(d v) v {\n",
+    "\tif o.ok {\n",
+    "\t\treturn o.val\n",
+    "\t}\n",
+    "\treturn d\n",
+    "}\n",
+    "\n",
+    "func (o option[v]) is_some() bool {\n",
+    "\treturn o.ok\n",
+    "}\n",
 );
 
 const SET_PRELUDE: &str = concat!(
@@ -419,6 +437,10 @@ pub struct Emitter {
     local_vars: BTreeSet<String>,
     /// Functions whose first result is a pointer type.
     ptr_returning_fns: BTreeSet<String>,
+    /// Vars known to hold a `set[…]` value (issue #646): `len(s)`/`delete(s, v)`
+    /// lower to the prelude methods `.len()`/`.remove(v)` instead of Go's
+    /// builtin `len`/`delete`, which reject a struct.
+    set_vars: BTreeSet<String>,
 }
 
 pub(crate) struct ScopeSnapshot {
@@ -427,6 +449,7 @@ pub(crate) struct ScopeSnapshot {
     var_ty: BTreeMap<String, (String, bool)>,
     var_struct: BTreeMap<String, String>,
     pointer_vars: BTreeSet<String>,
+    set_vars: BTreeSet<String>,
 }
 
 impl Emitter {
@@ -462,6 +485,7 @@ impl Emitter {
             pointer_vars: BTreeSet::new(),
             local_vars: BTreeSet::new(),
             ptr_returning_fns: BTreeSet::new(),
+            set_vars: BTreeSet::new(),
             explicit_imports: BTreeMap::new(),
         }
     }
@@ -477,6 +501,7 @@ impl Emitter {
             var_ty: self.var_ty.clone(),
             var_struct: self.var_struct.clone(),
             pointer_vars: self.pointer_vars.clone(),
+            set_vars: self.set_vars.clone(),
         }
     }
 
@@ -486,6 +511,7 @@ impl Emitter {
         self.var_ty = saved.var_ty;
         self.var_struct = saved.var_struct;
         self.pointer_vars = saved.pointer_vars;
+        self.set_vars = saved.set_vars;
     }
 
     pub(crate) fn shadow_local_name(&mut self, name: &str) {
@@ -1081,6 +1107,10 @@ impl Emitter {
             self.var_ty.insert(name.to_string(), (base, ptr));
         } else if self.struct_fields.contains_key(&base) {
             self.var_struct.insert(name.to_string(), base);
+        } else if base.starts_with("set[") {
+            // Issue #646: track set-typed vars so `len(s)`/`delete(s, v)`
+            // lower to the prelude's `.len()`/`.remove(v)` methods.
+            self.set_vars.insert(name.to_string());
         }
     }
 
