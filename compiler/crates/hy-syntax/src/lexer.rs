@@ -176,6 +176,19 @@ enum Frame {
     Interp { depth: u32 },
 }
 
+/// One resolved escape sequence.
+///
+/// In an interpreted string, Go's `\xNN` and `\NNN` escapes denote a BYTE,
+/// not a Unicode scalar (LX7 adopts Go's escape set). Cooking them through
+/// `char` re-encoded 0xC3 as U+00C3 (UTF-8 bytes c3 83), so `"\xc3\xa9"`
+/// was four bytes instead of the two-byte encoding of `é` (#1199).
+enum Escape {
+    /// A Unicode scalar: named escapes, `\u`, `\U`, and rune-mode byte escapes.
+    Char(char),
+    /// One raw string byte from an interpreted-string `\xNN` / `\NNN` escape.
+    Byte(u8),
+}
+
 struct Lexer<'a> {
     path: String,
     chars: Vec<char>,
@@ -613,8 +626,7 @@ impl<'a> Lexer<'a> {
             Some('\\') => {
                 let esc_start = self.pos();
                 self.bump();
-                let e = self.escape_char(false);
-                if e.is_none() {
+                let Some(e) = self.escape_char(false) else {
                     // diagnostic already recorded; recover to closing quote on this line
                     while let Some(c) = self.at(0) {
                         if c == '\n' {
@@ -626,9 +638,14 @@ impl<'a> Lexer<'a> {
                         }
                     }
                     return self.tok(start, Tok::CharLit('\0'));
-                }
+                };
                 let _ = esc_start;
-                e.unwrap()
+                match e {
+                    Escape::Char(ch) => ch,
+                    // Rune mode never emits Byte (`\x`/octal are code points
+                    // there); keep the mapping total rather than panicking.
+                    Escape::Byte(b) => char::from_u32(b as u32).unwrap_or('\0'),
+                }
             }
             Some(c) if c != '\n' => {
                 self.bump();
@@ -730,7 +747,7 @@ impl<'a> Lexer<'a> {
     /// InterpOpen successor in `pending`).
     fn lex_str_segment(&mut self, emitted_any: bool) -> Option<Token> {
         let start = self.pos();
-        let mut cooked = String::new();
+        let mut cooked: Vec<u8> = Vec::new();
         loop {
             let Some(c) = self.at(0) else {
                 self.frames.pop();
@@ -739,7 +756,10 @@ impl<'a> Lexer<'a> {
                     return Some(self.tok(start, Tok::StrEnd));
                 }
                 self.pending = Some(self.tok(self.pos(), Tok::StrEnd));
-                return Some(self.tok(start, Tok::StrChunk(cooked)));
+                return {
+                    let chunk = self.finish_chunk(start, cooked);
+                    Some(self.tok(start, Tok::StrChunk(chunk)))
+                };
             };
             match c {
                 '"' => {
@@ -749,13 +769,16 @@ impl<'a> Lexer<'a> {
                         return Some(self.tok(start, Tok::StrEnd));
                     }
                     self.pending = Some(self.tok(self.pos(), Tok::StrEnd));
-                    return Some(self.tok(start, Tok::StrChunk(cooked)));
+                    return {
+                        let chunk = self.finish_chunk(start, cooked);
+                        Some(self.tok(start, Tok::StrChunk(chunk)))
+                    };
                 }
                 '{' => {
                     if self.at(1) == Some('{') {
                         self.bump();
                         self.bump();
-                        cooked.push('{');
+                        cooked.push(b'{');
                     } else {
                         self.bump();
                         // mark the Str frame as having emitted, push the interp frame
@@ -767,7 +790,10 @@ impl<'a> Lexer<'a> {
                             return Some(self.tok(start, Tok::InterpOpen));
                         }
                         self.pending = Some(self.tok(self.pos(), Tok::InterpOpen));
-                        return Some(self.tok(start, Tok::StrChunk(cooked)));
+                        return {
+                            let chunk = self.finish_chunk(start, cooked);
+                            Some(self.tok(start, Tok::StrChunk(chunk)))
+                        };
                     }
                 }
                 '}' => {
@@ -776,30 +802,62 @@ impl<'a> Lexer<'a> {
                     if self.at(0) == Some('}') {
                         self.bump();
                     }
-                    cooked.push('}');
+                    cooked.push(b'}');
                 }
                 '\\' => {
                     self.bump();
                     match self.escape_char(true) {
-                        Some(e) => cooked.push(e),
+                        Some(Escape::Char(ch)) => Self::push_utf8(&mut cooked, ch),
+                        Some(Escape::Byte(b)) => cooked.push(b),
                         None => {
                             // unknown escape: keep the char verbatim (diag recorded)
                             if let Some(c2) = self.bump() {
-                                cooked.push(c2);
+                                Self::push_utf8(&mut cooked, c2);
                             }
                         }
                     }
                 }
                 _ => {
-                    cooked.push(c);
+                    Self::push_utf8(&mut cooked, c);
                     self.bump();
                 }
             }
         }
     }
 
+    /// Resolve a cooked chunk's BYTES to the token's UTF-8 payload.
+    ///
+    /// Strings are always UTF-8 (T3), so `\xNN`/`\NNN` escapes that do not
+    /// together spell well-formed UTF-8 are a parse error — never silently
+    /// re-encoded into different characters (the #1199 corruption) and never
+    /// silently replaced with U+FFFD.
+    fn finish_chunk(&mut self, start: Pos, bytes: Vec<u8>) -> String {
+        match String::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(err) => {
+                let valid = err.utf8_error().valid_up_to();
+                let bad = err.as_bytes().get(valid).copied().unwrap_or(0);
+                self.diags.push(
+                    Diagnostic::error(
+                        PARSE_ERR_CODE,
+                        self.path.clone(),
+                        Span::new(start, self.pos()),
+                        format!(
+                            "string literal is not valid UTF-8: byte 0x{bad:02x} at offset {valid} is not a well-formed sequence (T3; byte escapes `\\xNN`/`\\NNN` must together spell valid UTF-8 — use `\\u00e9`/`\\U0001F642` for code points)"
+                        ),
+                    )
+                    .with_rule("LX7"),
+                );
+                String::from_utf8_lossy(err.as_bytes()).into_owned()
+            }
+        }
+    }
+
     /// One escape sequence after `\`. `str_mode` selects the Go string escape
     /// set (`\uNNNN`); char literals use the rune set (`\u{…}`, LX6).
+    /// In `str_mode`, `\xNN`/`\NNN` resolve to `Escape::Byte` — Go defines
+    /// them as bytes, not code points — while rune literals keep code-point
+    /// semantics (LX6).
     ///
     /// Fail-closed contract (GUARANTEES.md row 4's spirit, extended to the
     /// lexer): every malformed escape this function can SEE must record a
@@ -807,20 +865,20 @@ impl<'a> Lexer<'a> {
     /// recorded" on `None`. The one silent `None` left is end-of-input
     /// mid-escape: the literal loop then runs to EOF and the caller emits
     /// its own `unterminated string/char literal` diagnostic.
-    fn escape_char(&mut self, str_mode: bool) -> Option<char> {
+    fn escape_char(&mut self, str_mode: bool) -> Option<Escape> {
         let start = self.pos();
         let c = self.bump()?;
         let out = match c {
-            'n' => '\n',
-            't' => '\t',
-            'r' => '\r',
-            '\\' => '\\',
-            '"' => '"',
-            '\'' => '\'',
-            'a' => '\u{7}',
-            'b' => '\u{8}',
-            'f' => '\u{c}',
-            'v' => '\u{b}',
+            'n' => Escape::Char('\n'),
+            't' => Escape::Char('\t'),
+            'r' => Escape::Char('\r'),
+            '\\' => Escape::Char('\\'),
+            '"' => Escape::Char('"'),
+            '\'' => Escape::Char('\''),
+            'a' => Escape::Char('\u{7}'),
+            'b' => Escape::Char('\u{8}'),
+            'f' => Escape::Char('\u{c}'),
+            'v' => Escape::Char('\u{b}'),
             'x' => {
                 let mut v: u32 = 0;
                 for _ in 0..2 {
@@ -837,8 +895,13 @@ impl<'a> Lexer<'a> {
                     };
                     v = v * 16 + d;
                 }
-                // v <= 0xFF is always a scalar value; from_u32 cannot fail.
-                char::from_u32(v)?
+                if str_mode {
+                    // Go string semantics: \xNN is one raw BYTE (LX7).
+                    Escape::Byte(v as u8)
+                } else {
+                    // Rune literals are code points: '\x41' is 'A'.
+                    Escape::Char(char::from_u32(v)?)
+                }
             }
             'u' => {
                 if str_mode {
@@ -857,7 +920,7 @@ impl<'a> Lexer<'a> {
                         };
                         v = v * 16 + d;
                     }
-                    self.scalar_or_diag(v, start, str_mode, "\\u")?
+                    Escape::Char(self.scalar_or_diag(v, start, str_mode, "\\u")?)
                 } else {
                     // rune style: \u{1F600}
                     if self.bump() != Some('{') {
@@ -900,7 +963,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
-                    self.scalar_or_diag(v, start, str_mode, "\\u{…}")?
+                    Escape::Char(self.scalar_or_diag(v, start, str_mode, "\\u{…}")?)
                 }
             }
             'U' => {
@@ -919,7 +982,7 @@ impl<'a> Lexer<'a> {
                     };
                     v = v * 16 + d;
                 }
-                self.scalar_or_diag(v, start, str_mode, "\\U")?
+                Escape::Char(self.scalar_or_diag(v, start, str_mode, "\\U")?)
             }
             '0'..='7' => {
                 // octal \NNN — at most three digits (c plus up to two more),
@@ -942,7 +1005,12 @@ impl<'a> Lexer<'a> {
                     );
                     return None;
                 }
-                char::from_u32(v)?
+                if str_mode {
+                    // Go string semantics: \NNN is one raw BYTE (LX7).
+                    Escape::Byte(v as u8)
+                } else {
+                    Escape::Char(char::from_u32(v)?)
+                }
             }
             _ => {
                 self.diag(
@@ -978,6 +1046,11 @@ impl<'a> Lexer<'a> {
                 None
             }
         }
+    }
+
+    fn push_utf8(buf: &mut Vec<u8>, ch: char) {
+        let mut tmp = [0u8; 4];
+        buf.extend_from_slice(ch.encode_utf8(&mut tmp).as_bytes());
     }
 
     /// Record a malformed-escape diagnostic tagged with the lexical rule in
@@ -1153,6 +1226,50 @@ mod tests {
             Ok(_) => panic!("expected lex failure for: {src}"),
             Err(d) => d,
         }
+    }
+
+    // -- Go byte escapes keep their BYTES (issue #1199) ----------------------
+    // `\xNN` and `\NNN` in an interpreted string denote one raw byte each.
+    // Cooking them through `char` turned 0xC3 into U+00C3 (bytes c3 83), so
+    // `"\xc3\xa9"` (the UTF-8 encoding of `é`, two bytes) lexed as four
+    // bytes and compared unequal to `"é"` in an accepted program.
+
+    #[test]
+    fn byte_escapes_keep_their_bytes_in_strings() {
+        let t = toks(r#"s := "\xc3\xa9""#);
+        assert!(t.contains(&Tok::StrChunk("é".into())), "{t:?}");
+        let t = toks(r#"s := "\303\251""#);
+        assert!(t.contains(&Tok::StrChunk("é".into())), "{t:?}");
+        let t = toks(r#"s := "p:\xe4\xb8\xad:\xf0\x9f\x99\x82""#);
+        assert!(t.contains(&Tok::StrChunk("p:中:🙂".into())), "{t:?}");
+    }
+
+    #[test]
+    fn mixed_byte_and_scalar_escapes_stay_ordered() {
+        let t = toks(r#"s := "\x41\u00e9\101\U0001f642""#);
+        assert!(t.contains(&Tok::StrChunk("AéA🙂".into())), "{t:?}");
+    }
+
+    #[test]
+    fn invalid_utf8_byte_escape_is_diagnosed() {
+        let errs = lex_errs(r#"fn main() { s := "\xff" }"#);
+        assert!(
+            errs.iter()
+                .any(|d| d.message.contains("not valid UTF-8")
+                    && d.tier0_rule.as_deref() == Some("LX7")),
+            "{errs:?}"
+        );
+        let errs = lex_errs(r#"fn main() { s := "\xc3" }"#);
+        assert!(errs.iter().any(|d| d.message.contains("not valid UTF-8")), "{errs:?}");
+    }
+
+    #[test]
+    fn rune_byte_escapes_stay_code_points() {
+        // Rune literals are code points (LX6): '\x41' is 'A', '\303' is U+00C3.
+        let t = toks(r#"c := '\xe9'"#);
+        assert!(t.contains(&Tok::CharLit('\u{e9}')), "{t:?}");
+        let t = toks(r#"c := '\303'"#);
+        assert!(t.contains(&Tok::CharLit('\u{c3}')), "{t:?}");
     }
 
     #[test]

@@ -72,12 +72,28 @@ fn octal_escape_unbounded_digits_do_not_panic_or_silently_drop() {
 
 #[test]
 fn octal_escape_leading_zero_and_above_255_fail_closed() {
-    let toks = lex("test.hy", r#"fn main() { s := "\0\000\012\377" }"#).expect("valid octals");
+    let toks = lex("test.hy", r#"fn main() { s := "\0\000\012\101" }"#).expect("valid octals");
     assert!(
         toks.iter()
-            .any(|t| t.tok == Tok::StrChunk("\0\0\n\u{ff}".into())),
-        "expected \\0, \\000, \\012, \\377 to decode cleanly, got: {toks:?}"
+            .any(|t| t.tok == Tok::StrChunk("\0\0\nA".into())),
+        "expected \\0, \\000, \\012, \\101 to decode cleanly, got: {toks:?}"
     );
+
+    // `\377` (= byte 0xFF) is in octal range but is not valid UTF-8: interpreted
+    // strings are UTF-8 byte sequences (T3), so the literal is rejected instead
+    // of being re-encoded as U+00FF (issue #1199).
+    for src in [
+        r#"fn main() { s := "\377" }"#,
+        r#"fn main() { s := "\xff" }"#,
+    ] {
+        let errs = lex_errs(src);
+        assert!(
+            errs.iter().any(|d| d.code == "HYB-E0002"
+                && d.tier0_rule.as_deref() == Some("LX7")
+                && d.message.contains("not valid UTF-8")),
+            "expected HYB-E0002 [LX7] for non-UTF-8 byte in `{src}`, got: {errs:?}"
+        );
+    }
 
     for src in [
         r#"fn main() { s := "\400" }"#,
