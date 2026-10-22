@@ -625,8 +625,17 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     format!("the spawn callee `{}`", callee.render()),
                 );
                 let desc = format!("the spawn `task {}(...)`", callee.render());
-                let vals: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
-                let targets = ck.spawn_param_shapes(&st, callee, args.len());
+                let mut vals: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
+                let mut targets = ck.spawn_param_shapes(&st, callee, args.len());
+                // T23 forwarding (`task worker(pair(m))`): one expression fills
+                // every parameter slot, so every forwarded result must clear
+                // the sendability check — not just the first (issue #1174).
+                let mut value_shapes: Option<Vec<TypeShape>> = None;
+                if let Some((params, shapes)) = ck.forwarded_spawn_shapes(&st, callee, args) {
+                    vals = vec![&args[0].value; params.len()];
+                    targets = Some(params);
+                    value_shapes = Some(shapes);
+                }
                 ck.check_site(
                     &mut st,
                     *span,
@@ -637,6 +646,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     false,
                     Some(callee),
                     targets.as_deref(),
+                    value_shapes.as_deref(),
                 );
                 let cr = walk::CallRef {
                     callee,
@@ -684,6 +694,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                         *is_move,
                         None,
                         targets.as_deref(),
+                        None,
                     );
                     ck.check_chan_send_const_overflow(&st, chan, value);
                 }
@@ -800,6 +811,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                                     *is_move,
                                     None,
                                     targets.as_deref(),
+                                    None,
                                 );
                                 ck.check_chan_send_const_overflow(&st, chan, value);
                             }
@@ -5175,6 +5187,107 @@ mod tests {
             .filter(|d| d.code == "HYB-E3006")
             .count();
         assert_eq!(e3006_count, 2, "{:?}", r.diagnostics);
+    }
+
+    // ------------------------------------------------------------------
+    // #1174 — T23 forwarding at a spawn site: `task worker(pair(m))` must
+    // check EVERY forwarded result, not just the first.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn forwarded_multi_value_spawn_rejects_non_sendable_result() {
+        let r = check(
+            "fn pair(m map[string]int) (int, map[string]int) { return 1, m }\n\
+             fn worker(n int, m map[string]int) { m[\"worker\"] = n }\n\
+             fn main() {\n\
+               m := map[string]int{\"init\": 0}\n\
+               task worker(pair(m))\n\
+               m[\"main\"] = 2\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        let e3001 = r
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "HYB-E3001")
+            .unwrap_or_else(|| panic!("expected HYB-E3001, got {:?}", r.diagnostics));
+        assert!(
+            e3001.message.contains("result 2"),
+            "diagnostic must name the offending result: {}",
+            e3001.message
+        );
+    }
+
+    #[test]
+    fn forwarded_try_spawn_rejects_non_sendable_result() {
+        let r = check(
+            "fn pair_try(m map[string]int) (int, map[string]int, error) {\n\
+               return 1, m, nil\n\
+             }\n\
+             fn worker(n int, m map[string]int) { m[\"worker\"] = n }\n\
+             fn main() {\n\
+               m := map[string]int{\"init\": 0}\n\
+               task worker(pair_try(m)?)\n\
+               m[\"main\"] = 2\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3001" && d.message.contains("result 2")),
+            "{:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn forwarded_multi_value_spawn_fails_closed_on_unresolved_result() {
+        let r = check(
+            "fn pair_any() (int, any) { return 1, map[string]int{} }\n\
+             fn worker(n int, v any) { fmt.println(n)\n fmt.println(\"{v}\") }\n\
+             fn main() { task worker(pair_any()) }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert!(
+            r.diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3005" && d.message.contains("result 2")),
+            "{:?}",
+            r.diagnostics
+        );
+    }
+
+    #[test]
+    fn forwarded_multi_value_spawn_accepts_all_sendable_results() {
+        let r = check(
+            "fn pair(a int, b chan int) (int, chan int) { return a, b }\n\
+             fn worker(n int, c chan int) { c <- n }\n\
+             fn main() {\n\
+               ch := make(chan int, 4)\n\
+               task worker(pair(1, ch))\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Accept, "{:?}", r.diagnostics);
+    }
+
+    #[test]
+    fn forwarded_multi_value_spawn_arity_mismatch_does_not_cascade() {
+        // An arity mismatch is HYB-E1002's (buildable) territory; the
+        // forwarding expansion must not synthesize per-slot sendability
+        // diagnostics for a call whose results do not match the parameters.
+        let r = check(
+            "fn triple() (int, int, int) { return 1, 2, 3 }\n\
+             fn worker(n int, k int) { fmt.println(n + k) }\n\
+             fn main() { task worker(triple()) }",
+        );
+        assert!(
+            !r.diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3001" || d.code == "HYB-E3005"),
+            "arity mismatch must not cascade into a sendability diagnostic: {:?}",
+            r.diagnostics
+        );
     }
 }
 

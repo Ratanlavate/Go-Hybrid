@@ -633,21 +633,29 @@ impl<'a> Checker<'a> {
         callee: &Expr,
         argc: usize,
     ) -> Option<Vec<TypeShape>> {
+        let shapes = self.spawn_callee_param_shapes(st, callee)?;
+        if shapes.len() != argc {
+            return None;
+        }
+        Some(shapes)
+    }
+
+    /// Every parameter shape of the static spawn callee, without comparing
+    /// arity. None when the callee does not resolve statically.
+    pub(crate) fn spawn_callee_param_shapes(
+        &self,
+        st: &FnState,
+        callee: &Expr,
+    ) -> Option<Vec<TypeShape>> {
         match unwrap_parens(callee) {
             Expr::Ident { name, .. } => {
                 if self.lookup_binding(st, name).is_some() {
                     return None; // shadowed by a local binding — not a static fn call
                 }
                 let f = self.fns.get(name)?;
-                if f.params.len() != argc {
-                    return None;
-                }
                 Some(f.params.iter().map(|p| self.shape_of_type(&p.ty)).collect())
             }
             Expr::FnLit { params, .. } => {
-                if params.len() != argc {
-                    return None;
-                }
                 Some(params.iter().map(|p| self.shape_of_type(&p.ty)).collect())
             }
             Expr::Field {
@@ -666,13 +674,64 @@ impl<'a> Checker<'a> {
                 let f = recv_base.and_then(|rb| {
                     self.method_decls.get(&(rb, method_name.clone())).copied()
                 })?;
-                if f.params.len() != argc {
-                    return None;
-                }
                 Some(f.params.iter().map(|p| self.shape_of_type(&p.ty)).collect())
             }
             _ => None,
         }
+    }
+
+    /// T23 forwarding at a spawn site: `task worker(pair(m))` passes one
+    /// argument expression whose results fill every parameter slot. Returns
+    /// `(param_shapes, result_shapes)` so the caller checks each forwarded
+    /// result against its slot instead of only the first result (issue
+    /// #1174). None when the site is not a forwarded multi-value call.
+    pub(crate) fn forwarded_spawn_shapes(
+        &self,
+        st: &FnState,
+        callee: &Expr,
+        args: &[hy_syntax::CallArg],
+    ) -> Option<(Vec<TypeShape>, Vec<TypeShape>)> {
+        if args.len() != 1 {
+            return None;
+        }
+        let params = self.spawn_callee_param_shapes(st, callee)?;
+        let n = params.len();
+        if n < 2 {
+            return None;
+        }
+        let shapes = self.forwarded_multi_value_shapes(st, &args[0].value, n)?;
+        Some((params, shapes))
+    }
+
+    /// Per-result shapes when `value` forwards a multi-value call
+    /// (`pair(m)`, `pair_try(m)?`) into `n` slots. An unresolvable callee
+    /// yields `Unknown` shapes so the boundary stays fail-closed (O4.9).
+    /// An arity mismatch resolves to None: HYB-E1002 owns that diagnostic.
+    fn forwarded_multi_value_shapes(
+        &self,
+        st: &FnState,
+        value: &Expr,
+        n: usize,
+    ) -> Option<Vec<TypeShape>> {
+        let v = crate::model::unwrap_parens(value);
+        let (call, is_try) = match v {
+            Expr::Call { .. } => (v, false),
+            Expr::Try { operand, .. } => match crate::model::unwrap_parens(operand) {
+                c @ Expr::Call { .. } => (c, true),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let Expr::Call { callee, .. } = call else {
+            return None;
+        };
+        if let Some(results) = self.call_result_tys(st, callee) {
+            let avail = results.len().saturating_sub(usize::from(is_try));
+            if avail != n {
+                return None; // arity mismatch — HYB-E1002 reports it
+            }
+        }
+        Some(self.multi_value_shapes(st, v, n))
     }
 
     /// Could a value of shape `got` legitimately occupy a slot of shape
@@ -1125,6 +1184,7 @@ impl<'a> Checker<'a> {
         implicit_move: bool,
         spawn_callee: Option<&Expr>,
         target_shapes: Option<&[TypeShape]>,
+        value_shapes: Option<&[TypeShape]>,
     ) {
         self.total_sites += 1;
 
@@ -1221,8 +1281,13 @@ impl<'a> Checker<'a> {
                 continue;
             }
 
+            // A forwarded multi-value call fills several slots from ONE
+            // expression: collect its move operands once, not per result.
+            let collect_here = value_shapes.is_none() || vi == 0;
             let mut v_moves = Vec::new();
-            crate::model::collect_move_operands(v, &mut v_moves);
+            if collect_here {
+                crate::model::collect_move_operands(v, &mut v_moves);
+            }
             for (op, mspan) in v_moves {
                 if let Expr::Ident { name, .. } = op {
                     if self.lookup_binding(st, name).is_some() {
@@ -1283,10 +1348,17 @@ impl<'a> Checker<'a> {
                     Expr::Ident { .. } | Expr::Field { .. } | Expr::Index { .. }
                 );
 
-            let outcome = if is_auto_addressed {
-                self.classify_addr_of(st, v, crate::model::unwrap_parens(v))
-            } else {
-                self.classify_value(st, v)
+            let outcome = match value_shapes.and_then(|shapes| shapes.get(vi)) {
+                // T23 forwarding: judge each result by its own shape, not by
+                // the (first-result) shape of the shared expression.
+                Some(shape) => self.outcome_for_shape(
+                    shape,
+                    &format!("{} (result {})", v.render(), vi + 1),
+                ),
+                None if is_auto_addressed => {
+                    self.classify_addr_of(st, v, crate::model::unwrap_parens(v))
+                }
+                None => self.classify_value(st, v),
             };
 
             match outcome {

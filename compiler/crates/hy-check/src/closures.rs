@@ -808,8 +808,16 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 format!("the spawn callee `{}`", callee.render()),
             );
             let desc = format!("the spawn `task {}(...)`", callee.render());
-            let vals: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
-            let targets = ck.spawn_param_shapes(st, callee, args.len());
+            let mut vals: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
+            let mut targets = ck.spawn_param_shapes(st, callee, args.len());
+            // T23 forwarding (`task worker(pair(m))`): check every forwarded
+            // result against its slot (issue #1174).
+            let mut value_shapes: Option<Vec<TypeShape>> = None;
+            if let Some((params, shapes)) = ck.forwarded_spawn_shapes(st, callee, args) {
+                vals = vec![&args[0].value; params.len()];
+                targets = Some(params);
+                value_shapes = Some(shapes);
+            }
             ck.check_site(
                 st,
                 *span,
@@ -820,6 +828,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 false,
                 Some(callee),
                 targets.as_deref(),
+                value_shapes.as_deref(),
             );
             sync_nested_moves(st, nested);
             collect_stmt_direct_fnlits(stmt, st, nested);
@@ -849,7 +858,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 };
                 let vals: Vec<&Expr> = vec![value];
                 let targets = ck.chan_elem_shape(st, chan);
-                ck.check_site(st, *span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
+                ck.check_site(st, *span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref(), None);
                 ck.check_chan_send_const_overflow(st, chan, value);
             }
             sync_nested_moves(st, nested);
@@ -887,7 +896,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                             };
                             let vals: Vec<&Expr> = vec![value];
                             let targets = ck.chan_elem_shape(st, chan);
-                            ck.check_site(st, span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
+                            ck.check_site(st, span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref(), None);
                             ck.check_chan_send_const_overflow(st, chan, value);
                         }
                         sync_nested_moves(st, nested);
