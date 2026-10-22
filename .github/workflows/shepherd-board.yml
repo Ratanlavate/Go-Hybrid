@@ -34,10 +34,16 @@ defaults:
 
 jobs:
   board:
+    # A pull_request from a fork gets a read-only GITHUB_TOKEN, so every write
+    # step here (board PATCH, label sync, session log) would fail with
+    # "Resource not accessible by integration". Skip those runs entirely
+    # instead of checking a fix out under a red X; in-repo events still write.
     if: >-
-      github.actor != 'github-actions[bot]' ||
-      github.event_name == 'schedule' ||
-      github.event_name == 'workflow_dispatch'
+      (github.actor != 'github-actions[bot]' ||
+       github.event_name == 'schedule' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
