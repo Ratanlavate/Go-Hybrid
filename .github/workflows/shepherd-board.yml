@@ -50,8 +50,22 @@ jobs:
       - name: Gate (W1 is read/comment/label — allowed at dry-run)
         run: python3 tools/shepherd.py gate --require read
 
+      # Per-PR compare results are reused across runs (keyed by head SHA + main
+      # SHA), so an event that changes no PR head costs the REST listing alone
+      # (~5 core calls) instead of a full re-scan that exhausts the 1000/hr
+      # core quota and kills the board update with RateGuard.
+      - name: Restore triage scan cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: /tmp/triage-cache
+          key: triage-scan-${{ github.run_id }}
+          restore-keys: |
+            triage-scan-
+
       - name: Scan + classify every open PR
-        run: python3 tools/triage_bot.py --token-env GITHUB_TOKEN scan --out /tmp/triage --jobs 8
+        run: >-
+          python3 tools/triage_bot.py --token-env GITHUB_TOKEN scan
+          --out /tmp/triage --jobs 4 --cache /tmp/triage-cache/scan.json
 
       - name: Rewrite the board issue in place
         run: python3 tools/triage_bot.py --token-env GITHUB_TOKEN board --post --from-scan /tmp/triage/TRIAGE.json

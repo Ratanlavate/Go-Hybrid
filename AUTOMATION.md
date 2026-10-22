@@ -13,7 +13,7 @@ be relaxed:
 
 | Piece | Where | Cadence | What it does |
 |---|---|---|---|
-| `tools/triage_bot.py scan` | local / agent sessions | on demand | Classifies every open PR: wildcard hold, draft, conflicts, stale-base, duplicate cluster, tests-included, new arrival, overlap-risk. Writes `TRIAGE.md` + `TRIAGE.json`. `--verify K` runs the worktree merge gate on the top-K land-candidates. |
+| `tools/triage_bot.py scan` | local / agent sessions | on demand | Classifies every open PR: wildcard hold, draft, conflicts, stale-base, duplicate cluster, tests-included, new arrival, overlap-risk. Writes `TRIAGE.md` + `TRIAGE.json`. `--verify K` runs the worktree merge gate on the top-K land-candidates. `--cache FILE` reuses per-PR diff/compare results keyed by (head SHA, main SHA): an unchanged backlog costs the REST listing alone. A quota trip mid-scan degrades to `behind=unknown` (board marked "Degraded scan") instead of aborting. |
 | `tools/triage_bot.py approve` | local / agent sessions | on demand | Approves `action_required` CI runs for open PR heads (was ~190 manual clicks per session). Quota-guarded: `--max N`. `--dry` previews. |
 | `tools/triage_bot.py labels` | local / agent sessions | on demand | Ensures the `triage:*` palette and applies per-PR labels (protects wildcard holds from staleness, flags conflicts/dups). |
 | `tools/triage_bot.py board --post` | `.github/workflows/triage-board.yml` | daily 04:30 UTC + manual | Rewrites the **Triage Board** issue: Pareto NOW list, land-candidates, conflicts, stale bases, duplicate clusters, new arrivals, wildcard holds. |
@@ -23,7 +23,7 @@ be relaxed:
 ## Session start (the 30-second context restore)
 
 ```bash
-python3 tools/triage_bot.py scan --out /tmp/triage        # fresh queue
+python3 tools/triage_bot.py scan --out /tmp/triage        # fresh queue (add --cache /tmp/triage-cache/scan.json to reuse compare results)
 python3 tools/triage_bot.py approve --max 40              # unblock CI
 ```
 

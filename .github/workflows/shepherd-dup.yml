@@ -52,8 +52,18 @@ jobs:
       - name: Gate (Phase A is comment/label => dry-run suffices)
         run: python3 tools/shepherd.py gate --require dry-run
 
+      - name: Restore triage scan cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: /tmp/triage-cache
+          key: triage-scan-${{ github.run_id }}
+          restore-keys: |
+            triage-scan-
+
       - name: Scan + classify (fresh clusters)
-        run: python3 tools/triage_bot.py --token-env GITHUB_TOKEN scan --out /tmp/triage --jobs 8
+        run: >-
+          python3 tools/triage_bot.py --token-env GITHUB_TOKEN scan
+          --out /tmp/triage --jobs 4 --cache /tmp/triage-cache/scan.json
 
       - name: W4 duplicate-cluster pass
         run: |
