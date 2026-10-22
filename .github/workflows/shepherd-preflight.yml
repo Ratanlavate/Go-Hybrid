@@ -68,23 +68,37 @@ jobs:
             echo "Pinned toolchains: Go $(go version | awk '{print $3}'), $(rustc --version | awk '{print $2}')"
             echo
           } > /tmp/preflight.md
-          if go build ./... ; then
-            echo "- go build: **pass**" >> /tmp/preflight.md
+          # This repo has no root Go module or Cargo workspace (the compiler
+          # lives in compiler/ and the Go side is emitted, not stored). The
+          # old unconditional `go build ./...` / `cargo build -p hyb` failed
+          # on every land-candidate PR with "directory prefix . does not
+          # contain main module". Gate each check on its manifest and say so
+          # explicitly — skipped is reported, never silently passed.
+          if [ -f go.mod ]; then
+            if go build ./... ; then
+              echo "- go build: **pass**" >> /tmp/preflight.md
+            else
+              echo "- go build: **FAIL**" >> /tmp/preflight.md
+              exit 1
+            fi
+            if go vet ./... ; then
+              echo "- go vet: **pass**" >> /tmp/preflight.md
+            else
+              echo "- go vet: **FAIL**" >> /tmp/preflight.md
+              exit 1
+            fi
           else
-            echo "- go build: **FAIL**" >> /tmp/preflight.md
-            exit 1
+            echo "- go build / vet: **skipped** — no root Go module at HEAD; the emitted-Go gates run in the \`compiler\` job (gomod-integration + runtime hygiene)" >> /tmp/preflight.md
           fi
-          if go vet ./... ; then
-            echo "- go vet: **pass**" >> /tmp/preflight.md
+          if [ -f compiler/Cargo.toml ]; then
+            if cargo build --quiet -p hyb --manifest-path compiler/Cargo.toml ; then
+              echo "- classifier build (hyb): **pass**" >> /tmp/preflight.md
+            else
+              echo "- classifier build (hyb): **FAIL**" >> /tmp/preflight.md
+              exit 1
+            fi
           else
-            echo "- go vet: **FAIL**" >> /tmp/preflight.md
-            exit 1
-          fi
-          if cargo build -p hyb --quiet ; then
-            echo "- classifier build (hyb): **pass**" >> /tmp/preflight.md
-          else
-            echo "- classifier build (hyb): **FAIL**" >> /tmp/preflight.md
-            exit 1
+            echo "- classifier build (hyb): **skipped** — no Cargo workspace at HEAD" >> /tmp/preflight.md
           fi
           # no head-pipe here: pipefail + early-closing head would eat the
           # tool's exit code (the exact class of bug this repo logged twice)
